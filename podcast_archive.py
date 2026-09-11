@@ -9,6 +9,7 @@ import email.utils
 import hashlib
 import json
 import mimetypes
+import math
 from pathlib import Path
 import re
 import sys
@@ -86,6 +87,157 @@ def extension(url, mime, fallback='.bin'):
     if re.fullmatch(r'\.[a-z0-9]{1,8}', suffix):
         return suffix
     return mimetypes.guess_extension(mime) or fallback
+
+
+def chapter_seconds(value):
+    """Convert Podlove Normal Play Time to numeric seconds."""
+    if not isinstance(value, str) or not re.fullmatch(r'\d+(?::\d+){0,2}(?:\.\d+)?', value):
+        raise ValueError(f'Invalid chapter time: {value!r}')
+    parts = value.split(':')
+    if len(parts) > 1 and any(float(v) >= 60 for v in parts[1:]):
+        raise ValueError(f'Invalid chapter time: {value!r}')
+    result = 0.0
+    for part in parts:
+        result = result * 60 + float(part)
+    if not math.isfinite(result):
+        raise ValueError('Chapter time must be finite')
+    return int(result) if result.is_integer() else result
+
+
+def chapter_json(raw):
+    """Validate chapter JSON, or convert a Podlove chapters XML document."""
+    try:
+        data = json.loads(raw)
+    except (ValueError, UnicodeError):
+        if re.search(br'<!\s*(DOCTYPE|ENTITY)\b', raw.replace(b'\x00', b''), re.I):
+            raise ValueError('DTD/entity declarations are not supported')
+        try:
+            root = ET.fromstring(raw)
+        except ET.ParseError as exc:
+            raise ValueError('Chapters are neither valid JSON nor Podlove XML') from exc
+        if root.tag not in (f'{{{PSC}}}chapters', 'chapters'):
+            raise ValueError('Expected a Podlove chapters XML root')
+        chapters = []
+        for node in root:
+            if node.tag not in (f'{{{PSC}}}chapter', 'chapter'):
+                raise ValueError('Unsupported element in chapter XML')
+            if node.get('title') is None:
+                raise ValueError('XML chapter is missing its title')
+            chapter = {'startTime': chapter_seconds(node.get('start')),
+                       'title': node.get('title')}
+            for source, target in [('href', 'url'), ('image', 'img')]:
+                if node.get(source):
+                    chapter[target] = node.get(source)
+            chapters.append(chapter)
+        chapters.sort(key=lambda chapter: chapter['startTime'])
+        data = {'version': '1.2.0', 'chapters': chapters}
+    if not isinstance(data, dict) or not isinstance(data.get('chapters'), list):
+        raise ValueError('Chapter JSON must be an object containing a chapters array')
+    for chapter in data['chapters']:
+        if not isinstance(chapter, dict):
+            raise ValueError('Each chapter must be an object')
+        start = chapter.get('startTime')
+        if isinstance(start, bool) or not isinstance(start, (int, float)) or not math.isfinite(start) or start < 0:
+            raise ValueError('Each chapter needs a finite, nonnegative numeric startTime')
+    # Keep all publisher JSON fields, including endTime, img, url and version.
+    # XML has no end times, so conversion does not invent them.
+    return (json.dumps(data, indent=2, ensure_ascii=False, allow_nan=False) + '\n').encode('utf-8')
+
+
+def save_chapters(raw, target):
+    output = chapter_json(raw)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temp = target.with_name(target.name + '.part')
+    try:
+        temp.write_bytes(output)
+        temp.replace(target)
+    finally:
+        temp.unlink(missing_ok=True)
+    return {'bytes': len(output), 'sha256': hashlib.sha256(output).hexdigest(),
+            'content_type': 'application/json'}
+
+
+def download_chapters(url, target, timeout, attempts):
+    staged = target.with_name(target.name + '.download')
+    try:
+        source = transfer(url, staged, timeout, attempts)
+        return {**save_chapters(staged.read_bytes(), target), 'source_download': source}
+    finally:
+        staged.unlink(missing_ok=True)
+
+
+def download_chapter_images(chapter_path, images_dir, base_url, timeout, attempts):
+    """Download each chapter's img URL; preserve the JSON's original URLs."""
+    data = json.loads(chapter_path.read_bytes())
+    results = []
+    for index, chapter in enumerate(data['chapters'], 1):
+        image_url = chapter.get('img')
+        if not image_url:
+            continue
+        asset = {'kind': 'chapter_image', 'chapter_index': index,
+                 'chapter_file': chapter_path.name, 'url': image_url}
+        results.append(asset)
+        try:
+            if not isinstance(image_url, str):
+                raise ValueError('Chapter img must be a URL string')
+            image_url = urllib.parse.urljoin(base_url, image_url)
+            asset['url'] = image_url
+            # Use response MIME when the URL has no recognizable image extension.
+            ext = extension(image_url, '')
+            if ext not in ('.jpg', '.jpeg', '.png', '.webp', '.gif', '.avif', '.svg'):
+                ext = '.bin'
+            target = images_dir / f'{chapter_path.stem}-chapter{index:03d}{ext}'
+            meta = transfer(image_url, target, timeout, attempts)
+            if ext == '.bin':
+                real_ext = extension('', meta['content_type'])
+                if real_ext != '.bin':
+                    renamed = target.with_suffix(real_ext)
+                    target.replace(renamed)
+                    target = renamed
+            asset.update(meta, file=str(target), status='downloaded')
+        except Exception as exc:
+            asset.update(status='failed', error=str(exc))
+            print(f'  FAILED: chapter image {index}: {exc}', file=sys.stderr)
+    return results
+
+
+def convert_existing_chapters(directory, timeout=60, attempts=3):
+    """Create JSON copies of old .bin/.xml chapter files without downloading audio."""
+    folder = Path(directory)
+    if not folder.is_dir():
+        raise ValueError('Pass the existing chapters directory to --convert-chapters')
+    sources = sorted(p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in ('.xml', '.bin', '.json'))
+    if not sources:
+        raise ValueError('No .xml, .bin or .json files found in the specified chapters directory')
+    output = folder / 'converted-json'
+    failures = 0
+    image_failures = 0
+    image_records = []
+    for source in sources:
+        # Legacy ep001.embedded01.xml becomes ep001.json if available.
+        stem = re.sub(r'\.embedded\d+$', '', source.stem)
+        try:
+            content = chapter_json(source.read_bytes())
+            target = output / (stem + '.json')
+            serial = 2
+            while target.exists() and target.read_bytes() != content:
+                target = output / f'{stem}-{serial:02d}.json'
+                serial += 1
+            if not target.exists():
+                save_chapters(content, target)
+            print(f'{source.name} -> {target}', flush=True)
+            image_assets = download_chapter_images(target, folder / 'images', '', timeout, attempts)
+            image_records.extend(image_assets)
+            image_failures += sum(a['status'] == 'failed' for a in image_assets)
+        except Exception as exc:
+            failures += 1
+            print(f'FAILED: {source.name}: {exc}', file=sys.stderr)
+    output.mkdir(parents=True, exist_ok=True)
+    (output / 'image-download-report.json').write_text(
+        json.dumps(image_records, indent=2, ensure_ascii=False), encoding='utf-8')
+    print(f'Converted {len(sources) - failures} files; {failures} conversion failures; '
+          f'{image_failures} image failures. Originals retained.')
+    return 1 if failures or image_failures else 0
 
 
 def images(el):
@@ -236,7 +388,7 @@ def run(args):
                 record['missing'].append('images')
             for kind, asset_url, mime in dict.fromkeys(assets):
                 asset_url = urllib.parse.urljoin(base, asset_url)
-                ext = extension(asset_url, mime)
+                ext = '.json' if kind == 'chapters' else extension(asset_url, mime)
                 relative = Path(kind) / f'{name}{ext}'
                 serial = 2
                 while str(relative) in used_paths:
@@ -246,21 +398,49 @@ def run(args):
                 asset = {'kind': kind, 'url': asset_url, 'file': str(relative)}
                 record['assets'].append(asset)
                 try:
-                    asset.update(transfer(asset_url, dest / relative, args.timeout, args.attempts))
+                    downloader = download_chapters if kind == 'chapters' else transfer
+                    asset.update(downloader(asset_url, dest / relative, args.timeout, args.attempts))
                     asset['status'] = 'downloaded'
                 except Exception as exc:
                     asset.update(status='failed', error=str(exc))
                     manifest['errors'].append(f'{name}: {kind}: {exc}')
                     print(f'  FAILED: {kind}: {exc}', file=sys.stderr)
                 save()
-            # Preserve embedded Podlove chapters as XML, not invented JSON.
-            for index, node in enumerate(item.findall(f'{{{PSC}}}chapters'), 1):
-                rel = Path('chapters') / f'{name}.embedded{index:02d}.xml'
-                (dest / rel).parent.mkdir(exist_ok=True)
-                (dest / rel).write_bytes(ET.tostring(node, encoding='utf-8', xml_declaration=True))
-                record['assets'].append({'kind': 'chapters', 'file': str(rel), 'status': 'extracted'})
-                if 'chapters' in record['missing']:
-                    record['missing'].remove('chapters')
+            # Prefer downloaded chapter JSON; use embedded Podlove chapters as fallback.
+            downloaded_chapters = any(a['kind'] == 'chapters' and a['status'] == 'downloaded'
+                                      for a in record['assets'])
+            if not downloaded_chapters:
+                for node in item.findall(f'{{{PSC}}}chapters')[:1]:
+                    rel = Path('chapters') / f'{name}.json'
+                    serial = 2
+                    while str(rel) in used_paths:
+                        rel = Path('chapters') / f'{name}-{serial:02d}.json'
+                        serial += 1
+                    used_paths.add(str(rel))
+                    asset = {'kind': 'chapters', 'file': str(rel), 'source': 'embedded Podlove XML'}
+                    record['assets'].append(asset)
+                    try:
+                        asset.update(save_chapters(ET.tostring(node, encoding='utf-8'), dest / rel))
+                        asset['status'] = 'converted'
+                        if 'chapters' in record['missing']:
+                            record['missing'].remove('chapters')
+                    except Exception as exc:
+                        asset.update(status='failed', error=str(exc))
+                        manifest['errors'].append(f'{name}: embedded chapters: {exc}')
+                        print(f'  FAILED: embedded chapters: {exc}', file=sys.stderr)
+            for chapter_asset in list(record['assets']):
+                if chapter_asset['kind'] != 'chapters' or chapter_asset['status'] not in ('downloaded', 'converted'):
+                    continue
+                chapter_path = dest / chapter_asset['file']
+                chapter_base = chapter_asset.get('source_download', {}).get('resolved_url', base)
+                image_assets = download_chapter_images(chapter_path, dest / 'chapters' / 'images',
+                                                       chapter_base, args.timeout, args.attempts)
+                for image_asset in image_assets:
+                    if 'file' in image_asset:
+                        image_asset['file'] = str(Path(image_asset['file']).relative_to(dest))
+                    if image_asset['status'] == 'failed':
+                        manifest['errors'].append(f"{name}: chapter image: {image_asset['error']}")
+                record['assets'].extend(image_assets)
             save()
     except Exception as exc:
         manifest['errors'].append(str(exc))
@@ -274,7 +454,9 @@ def run(args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('feed', help='RSS feed URL, quoted if it contains query parameters')
+    parser.add_argument('feed', nargs='?', help='RSS feed URL, quoted if it contains query parameters')
+    parser.add_argument('--convert-chapters', metavar='DIRECTORY',
+                        help='Convert existing chapters to JSON and download chapter images without downloading audio')
     parser.add_argument('-o', '--output', default='podcast-backup', help='Parent backup directory')
     parser.add_argument('--sequential', action='store_true',
                         help='Number regular episodes chronologically instead of using feed numbers')
@@ -283,9 +465,15 @@ def main():
     parser.add_argument('--attempts', type=int, default=3, help='Download attempts per file')
     parser.add_argument('--max-pages', type=int, default=100, help='RSS pagination safety limit')
     args = parser.parse_args()
+    if args.convert_chapters and args.feed:
+        parser.error('Use either a feed URL or --convert-chapters, not both')
+    if not args.feed and not args.convert_chapters:
+        parser.error('Provide a feed URL or --convert-chapters DIRECTORY')
     if args.attempts < 1 or args.timeout <= 0 or args.max_pages < 1:
         parser.error('attempts, timeout, and max-pages must be positive')
     try:
+        if args.convert_chapters:
+            return convert_existing_chapters(args.convert_chapters, args.timeout, args.attempts)
         return run(args)
     except KeyboardInterrupt:
         print('Interrupted. Completed files and feed snapshots remain saved.', file=sys.stderr)
